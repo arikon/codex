@@ -119,8 +119,16 @@ impl OpenAiModelsEndpoint {
         self
     }
 
+    fn request_auth_manager(&self) -> Option<&Arc<AuthManager>> {
+        self.auth_manager.as_ref().filter(|_| {
+            self.provider_info.requires_openai_auth
+                || self.provider_info.auth.is_some()
+                || self.runtime_auth.is_some()
+        })
+    }
+
     async fn auth(&self) -> Option<CodexAuth> {
-        let auth_manager = self.auth_manager.clone()?;
+        let auth_manager = self.request_auth_manager()?.clone();
         // Catalog startup has its own deadline. Let rotating credentials finish
         // saving even when that caller stops waiting.
         match tokio::spawn(async move { auth_manager.auth().await }).await {
@@ -159,7 +167,7 @@ impl OpenAiModelsEndpoint {
     ) -> CoreResult<ModelsEndpointResponse> {
         let resolved = resolve_request_auth(
             self.provider_info.clone(),
-            self.auth_manager.clone(),
+            self.request_auth_manager().cloned(),
             self.runtime_auth.clone(),
             /*scope*/ None,
             self.provider_info
@@ -336,8 +344,7 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
 
     fn identity(&self) -> Option<String> {
         let auth = self
-            .auth_manager
-            .as_ref()
+            .request_auth_manager()
             .and_then(|manager| manager.auth_cached());
         crate::models_identity::identity(&self.provider_info, auth.as_ref()).ok()
     }

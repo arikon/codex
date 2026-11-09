@@ -61,6 +61,12 @@ pub(crate) async fn resolve_request_auth(
                     return Ok(resolved);
                 }
 
+                if !info.requires_openai_auth && info.auth.is_none() {
+                    return Ok(ResolvedProviderAuth::new(resolve_provider_auth(
+                        None, &info,
+                    )?));
+                }
+
                 let credential = match &manager {
                     Some(manager) => manager.auth().await,
                     None => None,

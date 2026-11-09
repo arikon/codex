@@ -94,6 +94,8 @@ use serde_json::json;
 use std::io::Write;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wiremock::Mock;
@@ -1599,6 +1601,93 @@ async fn includes_session_id_thread_id_and_model_headers_in_request(
         session_id_string.as_str(),
         thread_id_string.as_str(),
     );
+}
+
+struct UnrelatedChatgptAuth {
+    refreshes: AtomicUsize,
+}
+
+impl codex_login::ExternalAuth for UnrelatedChatgptAuth {
+    fn resolve(&self) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(CodexAuth::create_dummy_chatgpt_auth_for_testing()) })
+    }
+
+    fn refresh(
+        &self,
+        _context: codex_login::ExternalAuthRefreshContext,
+    ) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("unrelated ChatGPT refresh failed"))
+        })
+    }
+
+    fn classify_error(&self, error: std::io::Error) -> codex_login::RefreshTokenError {
+        codex_login::auth::RefreshTokenFailedError::new(
+            codex_login::auth::RefreshTokenFailedReason::Other,
+            error.to_string(),
+        )
+        .into()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_provider_unauthorized_does_not_refresh_unrelated_chatgpt_auth() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_string("custom provider rejected the request"),
+        )
+        .mount(&server)
+        .await;
+    let external = Arc::new(UnrelatedChatgptAuth {
+        refreshes: AtomicUsize::new(0),
+    });
+    let manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    manager.set_external_auth(external.clone()).await?;
+    let test = test_codex()
+        .with_auth_manager(manager)
+        .with_config(|config| {
+            config.model_provider.requires_openai_auth = false;
+            config.model_provider.supports_websockets = false;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build(&server)
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let EventMsg::Error(error) =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!();
+    };
+
+    assert!(
+        error
+            .message
+            .contains("custom provider rejected the request"),
+        "unexpected provider error: {}",
+        error.message,
+    );
+    assert_eq!(external.refreshes.load(Ordering::SeqCst), 0);
+    let requests = server.received_requests().await.unwrap();
+    let model_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .collect::<Vec<_>>();
+    assert_eq!(model_requests.len(), 1);
+    assert!(!model_requests[0].headers.contains_key("authorization"));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -174,6 +174,12 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     /// manager throughout the codebase; that is a larger refactor than this change.
     fn auth_manager(&self) -> Option<Arc<AuthManager>>;
 
+    /// Returns the manager whose credentials authenticate model requests and can be
+    /// refreshed after an unauthorized response from this provider.
+    fn auth_manager_for_unauthorized_recovery(&self) -> Option<Arc<AuthManager>> {
+        self.auth_manager()
+    }
+
     /// Runtime authentication selected for this provider's inference destination.
     fn runtime_auth(&self) -> Option<&(Arc<RuntimeAuthManager>, RuntimeAuthMode)> {
         None
@@ -569,6 +575,17 @@ impl ModelProvider for ConfiguredModelProvider {
         self.auth_manager.clone()
     }
 
+    fn auth_manager_for_unauthorized_recovery(&self) -> Option<Arc<AuthManager>> {
+        if provider_uses_first_party_auth_path(&self.info)
+            || self.info.auth.is_some()
+            || self.runtime_auth.is_some()
+        {
+            self.auth_manager.clone()
+        } else {
+            None
+        }
+    }
+
     fn gateway_auth_manager(&self) -> std::io::Result<Option<Arc<GatewayAuthManager>>> {
         self.gateway_auth_manager
             .clone()
@@ -596,6 +613,12 @@ impl ModelProvider for ConfiguredModelProvider {
 
     fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
         Box::pin(async move {
+            if !self.info.requires_openai_auth
+                && self.info.auth.is_none()
+                && self.runtime_auth.is_none()
+            {
+                return None;
+            }
             match self.auth_manager.as_ref() {
                 Some(auth_manager) => auth_manager.auth().await,
                 None => None,

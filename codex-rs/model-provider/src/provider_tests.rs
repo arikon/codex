@@ -13,7 +13,11 @@ use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_login::auth::BedrockApiKeyAuth;
 use codex_model_provider_info::AwsAuthRefreshConfig;
 use codex_model_provider_info::AwsCredentialExportConfig;
+use codex_model_provider_info::GatewayOAuthConfig;
+use codex_model_provider_info::GatewayOAuthDelivery;
+use codex_model_provider_info::GatewayOAuthSettings;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
+use codex_model_provider_info::OAuthCredentialsStore;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_models_manager::ModelsManagerConfig;
@@ -250,6 +254,113 @@ impl codex_login::ExternalAuth for RotatingAuth {
     ) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
         self.resolve()
     }
+}
+
+#[tokio::test]
+async fn configured_provider_without_openai_auth_does_not_resolve_ambient_credentials() {
+    for bearer in [None, Some("provider-token")] {
+        let external = Arc::new(RotatingAuth(AtomicUsize::new(0)));
+        let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("ambient-token"));
+        manager.set_external_auth(external.clone()).await.unwrap();
+        let reads_before = external.0.load(Ordering::SeqCst);
+        let provider = create_model_provider(
+            ModelProviderInfo {
+                experimental_bearer_token: bearer.map(RedactedString::from),
+                ..provider_for("http://localhost:1234/v1".to_string())
+            },
+            Some(manager),
+        );
+
+        assert!(provider.auth().await.is_none());
+        let request = crate::resolve_request(
+            provider.as_ref(),
+            Some(ProviderAuthScope {
+                agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
+                session_source: SessionSource::Cli,
+                agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+            }),
+            None,
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+        .await
+        .expect("provider request should not need ambient credentials");
+        let headers = request.api_auth.to_auth_headers().unwrap();
+        assert_eq!(
+            headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|header| header.to_str().ok()),
+            bearer.map(|_| "Bearer provider-token"),
+        );
+        assert_eq!(external.0.load(Ordering::SeqCst), reads_before);
+    }
+}
+
+#[test]
+fn configured_provider_without_openai_auth_does_not_use_ambient_recovery_credentials() {
+    for (info, expected) in [
+        (provider_for("http://localhost:1234/v1".to_string()), false),
+        (
+            ModelProviderInfo {
+                experimental_bearer_token: Some("provider-token".into()),
+                ..provider_for("http://localhost:1234/v1".to_string())
+            },
+            false,
+        ),
+        (
+            ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+            true,
+        ),
+        (provider_info_with_command_auth(), true),
+    ] {
+        let provider = create_model_provider(
+            info,
+            Some(AuthManager::from_auth_for_testing(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            )),
+        );
+        assert_eq!(
+            provider.auth_manager_for_unauthorized_recovery().is_some(),
+            expected,
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_without_openai_auth_keeps_its_own_recovery_without_ambient_credentials() {
+    let provider = create_model_provider(
+        ModelProviderInfo {
+            gateway_oauth: Some(GatewayOAuthConfig::OAuth(GatewayOAuthSettings {
+                authorization_url: "https://gateway.example/authorize".to_string(),
+                device_authorization_url: None,
+                token_url: "https://gateway.example/token".to_string(),
+                client_id: "test".to_string(),
+                resource: None,
+                scopes: Vec::new(),
+                redirect_port: None,
+                credentials_store: OAuthCredentialsStore::File,
+                delivery: GatewayOAuthDelivery::default(),
+            })),
+            ..provider_for("https://gateway.example/v1".to_string())
+        },
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+    );
+    let unauthorized = TransportError::Http {
+        status: http::StatusCode::UNAUTHORIZED,
+        url: None,
+        headers: None,
+        body: Some("gateway rejected the request".to_string()),
+        retry_after: None,
+    };
+
+    assert!(provider.gateway_auth_manager().unwrap().is_some());
+    assert!(provider.is_recoverable_auth_error(&unauthorized));
+    assert!(provider.auth_manager_for_unauthorized_recovery().is_none());
+    assert_eq!(
+        provider.recover_from_unauthorized().await.unwrap(),
+        ProviderUnauthorizedRecovery::NotConfigured,
+    );
 }
 
 #[tokio::test]

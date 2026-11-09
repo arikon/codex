@@ -1752,7 +1752,7 @@ impl ModelClientSession {
             return Ok(());
         }
         let provider = Arc::clone(&self.client.state.provider);
-        let auth_manager = provider.auth_manager();
+        let auth_manager = provider.auth_manager_for_unauthorized_recovery();
         let mut auth_recovery = auth_manager
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
@@ -1976,7 +1976,11 @@ impl ResponsesHttpExecutor<'_> {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
-        let auth_manager = self.client.state.provider.auth_manager();
+        let auth_manager = self
+            .client
+            .state
+            .provider
+            .auth_manager_for_unauthorized_recovery();
         let mut auth_recovery = auth_manager
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
@@ -2187,7 +2191,7 @@ impl ModelClientSession {
     ) -> Result<WebsocketStreamOutcome> {
         let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
         let provider = Arc::clone(&self.client.state.provider);
-        let auth_manager = provider.auth_manager();
+        let auth_manager = provider.auth_manager_for_unauthorized_recovery();
         let thread_id = self.client.state.thread_id.to_string();
         let kind = if warmup {
             codex_extension_api::ModelRequestKind::Warmup
